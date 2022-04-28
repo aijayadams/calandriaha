@@ -4,6 +4,9 @@
 //   - Wait for remote server to stop serving out shards.
 //   - Serve our shards.
 // If we can connect, and the other server is ready to serve, stop serving it's prefered shards
+use log::{debug, info};
+
+use std::sync::{Arc, Mutex};
 
 use tokio::time::{sleep, Duration};
 
@@ -12,21 +15,13 @@ use tonic::{Request, Response, Status};
 
 use calandria_ha::calha::calha;
 use calandria_ha::ping;
+use calha::get_state_client::GetStateClient;
 use calha::get_state_server::{GetState, GetStateServer};
-use calha::{GetStateRequest, GetStateResponse};
+use calha::{GetStateRequest, GetStateResponse, StateConfiguration};
 
 #[derive(Default)]
-pub struct HAStateServer {}
-
-fn build_response() -> GetStateResponse {
-    return GetStateResponse {
-        ready_to_serve: true,
-        prefered_serving_shard: 0,
-        direct_connect_healthy: true,
-        gateway_v4_healthy: true,
-        gateway_v6_healthy: false,
-        serving_shards: [0].to_vec(),
-    };
+pub struct HAStateServer {
+    state: Arc<Mutex<GetStateResponse>>,
 }
 
 #[tonic::async_trait]
@@ -35,43 +30,117 @@ impl GetState for HAStateServer {
         &self,
         _: Request<GetStateRequest>,
     ) -> Result<Response<GetStateResponse>, Status> {
-        let response = build_response();
-        Ok(Response::new(response))
+        debug!("Serve GetStateResponse: Aquire Lock");
+        let response = self.state.lock().unwrap().clone();
+        debug!("Serve GetStateResponse: Release Lock");
+
+        return Ok(Response::new(response));
     }
 }
 
-
-async fn start_server(addr: std::net::SocketAddr) -> Result<(), tonic::transport::Error> {
-    let primary_state_server = HAStateServer::default();
+async fn start_server(
+    config: StateConfiguration,
+    state_return: Arc<Mutex<GetStateResponse>>,
+) -> Result<(), tonic::transport::Error> {
+    let primary_state_server = HAStateServer {
+        state: state_return,
+    };
+    // Todo: There is probably a better way to get a [:::] socket
+    let serving_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)),
+        u16::try_from(config.port).ok().unwrap(),
+    );
+    info!("Starting status server on {:#}", serving_addr);
     return Server::builder()
         .add_service(GetStateServer::new(primary_state_server))
-        .serve(addr).await;
-
+        .serve(serving_addr)
+        .await;
 }
 
-async fn print_stuff(){
-    loop{
-        sleep(Duration::from_millis(1000)).await;
-        let (localhost, google, rubbish) = tokio::join!(
-            ping::ping("::1".parse().unwrap()),
-            ping::ping("2001:4860:4860::8888".parse().unwrap()),
-            ping::ping("10.4.5.5".parse().unwrap())
+async fn get_remote_state(
+    config: StateConfiguration,
+    state_return: Arc<Mutex<GetStateResponse>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        // Todo: Configure Poll Period
+        sleep(Duration::from_millis(5000)).await;
+        let remote_status_addr = format!(
+            "http://[{}]:{}",
+            config.direct_connect_target,
+            u16::try_from(config.port).ok().unwrap()
         );
-        
-        println!("Ping {}, {}, {}", localhost, google, rubbish);
+        info!("Request status update from {:#}", remote_status_addr);
+        // Todo: Recover the loop in the event of a failed connection
+        let mut client = GetStateClient::connect(remote_status_addr).await?;
+        let request = tonic::Request::new(GetStateRequest {});
+        let response = client.get_state(request).await?;
+        debug!("Status Update RESPONSE={:#?}", response);
+        debug!("Updating GetStateResponse: Aquire Lock");
+        state_return.lock().unwrap().prefered_serving_shard += 1;
+        debug!("Updating GetStateResponse: Release Lock");
+    }
+}
 
+async fn update_local_state(
+    config: StateConfiguration,
+    state_return: Arc<Mutex<GetStateResponse>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("interrogate local system to determine local state");
+    loop {
+        // Todo: Configure Poll Period
+        sleep(Duration::from_millis(5000)).await;
+        let (direct, v4gw, v6gw) = tokio::join!(
+            ping::ping(config.direct_connect_target.parse().unwrap()),
+            ping::ping(config.gateway_v4_target.parse().unwrap()),
+            ping::ping(config.gateway_v6_target.parse().unwrap())
+        );
+        debug!("Ping: Direct Connect Target Healthy: {}", direct);
+        debug!("Ping: IPv4 Gateway Target Healthy: {}", v4gw);
+        debug!("Ping: IPv6 Gateway Target Healthy: {}", v6gw);
+
+        debug!("Updating GetStateResponse: Aquire Lock");
+        let mut state_response_raw = state_return.lock().unwrap();
+        state_response_raw.direct_connect_healthy = direct;
+        state_response_raw.gateway_v4_healthy = v4gw;
+        state_response_raw.gateway_v6_healthy = v6gw;
+        // Force the response out of scope to realase the mutex
+        // ToDd: There is probably a block syntax for doing this that doesn't require the explicit descoping of state_response_raw
+        drop(state_response_raw);
+        debug!("Updating GetStateResponse: Release Lock");
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let addr = "0.0.0.0:50051".parse()?;
-        let _result = tokio::join!(
-            start_server(addr),
-            print_stuff());
+    env_logger::init();
 
+    // Todo: Accept CLI flags to configure
+    let config = StateConfiguration {
+        allow_serve: true,
+        prefered_serving_shard: 0,
+        direct_connect_target: "::1".to_string(),
+        gateway_v4_target: "192.168.2.3".to_string(),
+        gateway_v6_target: "2001:4860:4860::8888".to_string(),
+        port: 6969,
+    };
 
-    println!("Does execution get here?");
+    // Make response object available to server and update_state()
+    let states_vec = GetStateResponse {
+        ready_to_serve: true,
+        prefered_serving_shard: 1,
+        direct_connect_healthy: false,
+        gateway_v4_healthy: false,
+        gateway_v6_healthy: false,
+        serving_shards: Vec::new(),
+    };
+    let states = Arc::new(Mutex::new(states_vec));
+
+    let _result = tokio::join!(
+        start_server(config.clone(), states.clone()),
+        update_local_state(config.clone(), states.clone()),
+        get_remote_state(config.clone(), states.clone())
+    );
+    // Todo: Work out how signal handlers work and give a conservative response before dieing
 
     Ok(())
 }

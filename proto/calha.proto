@@ -15,3 +15,11 @@ message getStateResponse {
     bool gatewayV6Healthy = 5;
     repeated int32 servingShards = 6;
 }
+message stateConfiguration {
+    bool allowServe = 1;
+    int32 preferedServingShard = 2;
+    string directConnectTarget = 3;
+    string gatewayV4Target = 4;
+    string gatewayV6Target = 5;
+    int32 port = 6;
+}
