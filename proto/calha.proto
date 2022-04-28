@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package CalHA;
+
+service getState {
+    rpc getState(getStateRequest) returns (getStateResponse) {}
+}
+
+message getStateRequest {}
+message getStateResponse {
+    bool readyToServe = 1;
+    int32 preferedServingShard = 2;
+    bool directConnectHealthy = 3;
+    bool gatewayV4Healthy = 4;
+    bool gatewayV6Healthy = 5;
+    repeated int32 servingShards = 6;
+}
