@@ -4,11 +4,10 @@
 //   - Wait for remote server to stop serving out shards.
 //   - Serve our shards.
 // If we can connect, and the other server is ready to serve, stop serving it's prefered shards
-use log::{debug, info};
-
+use log::{debug, info, warn};
 use std::sync::{Arc, Mutex};
 
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, timeout};
 
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -57,6 +56,28 @@ async fn start_server(
         .await;
 }
 
+
+async fn make_remote_state_request(
+    state_return: Arc<Mutex<GetStateResponse>>,
+    remote_status_addr: tonic::transport::Uri,
+) -> Result<(), Box<dyn std::error::Error>> {
+
+        let mut client = match timeout(Duration::from_millis(500), GetStateClient::connect(remote_status_addr)).await {
+            Ok(c) => c.unwrap(),
+            Err(e) => return Err(Box::new(e)),
+        };
+     
+        let mut request = tonic::Request::new(GetStateRequest {});
+        request.set_timeout(Duration::from_secs(1));
+        let response = client.get_state(request).await;
+        debug!("Status Update RESPONSE={:#?}", response);
+        debug!("Updating GetStateResponse: Aquire Lock");
+        // Todo: Do something useful with the response
+        state_return.lock().unwrap().prefered_serving_shard += 1;
+        debug!("Updating GetStateResponse: Release Lock");
+        Ok(())
+}
+
 async fn get_remote_state(
     config: StateConfiguration,
     state_return: Arc<Mutex<GetStateResponse>>,
@@ -65,19 +86,17 @@ async fn get_remote_state(
         // Todo: Configure Poll Period
         sleep(Duration::from_millis(5000)).await;
         let remote_status_addr = format!(
-            "http://[{}]:{}",
+            "https://[{}]:{}",
             config.direct_connect_target,
             u16::try_from(config.port).ok().unwrap()
         );
         info!("Request status update from {:#}", remote_status_addr);
-        // Todo: Recover the loop in the event of a failed connection
-        let mut client = GetStateClient::connect(remote_status_addr).await?;
-        let request = tonic::Request::new(GetStateRequest {});
-        let response = client.get_state(request).await?;
-        debug!("Status Update RESPONSE={:#?}", response);
-        debug!("Updating GetStateResponse: Aquire Lock");
-        state_return.lock().unwrap().prefered_serving_shard += 1;
-        debug!("Updating GetStateResponse: Release Lock");
+        
+        match make_remote_state_request(state_return.clone(), remote_status_addr.parse().unwrap()).await{
+            Ok(_) => (info!("Remote State Updated.")),
+            Err(_) => warn!("Remote State Failed! Going back to try again.")
+        };
+
     }
 }
 
@@ -104,7 +123,7 @@ async fn update_local_state(
         state_response_raw.gateway_v4_healthy = v4gw;
         state_response_raw.gateway_v6_healthy = v6gw;
         // Force the response out of scope to realase the mutex
-        // ToDd: There is probably a block syntax for doing this that doesn't require the explicit descoping of state_response_raw
+        // Todo: There is probably a block syntax for doing this that doesn't require the explicit descoping of state_response_raw
         drop(state_response_raw);
         debug!("Updating GetStateResponse: Release Lock");
     }
